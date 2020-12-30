@@ -27,6 +27,7 @@ const char WWW_PASSWORD[] PROGMEM = "";
 #define SEND2INFLUX 0
 #define SEND2LORA 0
 #define SEND2CSV 0
+#define SEND2SDCARD 0
 #define SEND2CUSTOM 0
 
 // OpenSenseMap

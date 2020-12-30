@@ -122,6 +122,13 @@ String SOFTWARE_VERSION(SOFTWARE_VERSION_STR);
 #include "ext_def.h"
 #include "html-content.h"
 
+#include <RTClib.h>
+#include <SdFat.h> /* SD-Lib from https://github.com/greiman/SdFat */
+/* ATTENTION
+ *  comment out following lines in file SdFat.h, otherwise compile error
+// #if !defined(__has_include) || !__has_include(<FS.h>)
+// typedef File32 File;
+// #endif */
 
 /******************************************************************
  * The variables inside the cfg namespace are persistent          *
@@ -180,6 +187,7 @@ namespace cfg {
 	bool send2custom = SEND2CUSTOM;
 	bool send2influx = SEND2INFLUX;
 	bool send2csv = SEND2CSV;
+	bool send2sdcard = SEND2SDCARD;
 
 	bool auto_update = AUTO_UPDATE;
 	bool use_beta = USE_BETA;
@@ -319,6 +327,43 @@ DallasTemperature ds18b20(&oneWire);
  * GPS declaration                                               *
  *****************************************************************/
 TinyGPSPlus gps;
+
+/*****************************************************************
+ * SDCARD declaration                                            *
+ *****************************************************************/
+/* const int chipSelect = 10;  /* used for Arduino */
+const int chipSelect = D8;  /* used for ESP8266 */
+bool sdcard_init_failed = false;
+
+/* SD_FAT_TYPE
+0 for SdFat (File) as defined in SdFatConfig.h
+1 for SdFat32 FAT16/FAT32 (File32)
+2 for SdExFat exFAT (ExFile)
+3 for SdFs FAT16/FAT32/exFAT (FsFile) */
+#define SD_FAT_TYPE 3
+SdFs SD;
+
+/* SDCARD_SS_PIN is defined for the built-in SD on some boards */
+#ifndef SDCARD_SS_PIN
+const uint8_t SD_CS_PIN = SS;
+#else
+/* Assume built-in SD is used. */
+const uint8_t SD_CS_PIN = SDCARD_SS_PIN;
+#endif
+
+/* Try to select the best SD card configuration. */
+#if HAS_SDIO_CLASS
+#define SD_CONFIG SdioConfig(FIFO_SDIO)
+#elif ENABLE_DEDICATED_SPI
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, DEDICATED_SPI)
+#else
+#define SD_CONFIG SdSpiConfig(SD_CS_PIN, SHARED_SPI)
+#endif
+
+/*****************************************************************
+ * RTC_DS3231 declaration (RTC coupled to checkbox send2sdcard)  *
+ *****************************************************************/
+RTC_DS3231 rtc;
 
 /*****************************************************************
  * Variable Definitions for PPD24NS                              *
@@ -478,6 +523,7 @@ String last_value_SDS_version;
 
 unsigned long SDS_error_count;
 unsigned long WiFi_error_count;
+unsigned long Data_restored_count;
 
 unsigned long last_page_load = millis();
 
@@ -576,6 +622,26 @@ static String SDS_version_date() {
 	}
 
 	return last_value_SDS_version;
+}
+
+/*****************************************************************
+ * Helper function uint64 to string conversion                   *
+ *****************************************************************/
+String uint64ToString(uint64_t input) {
+  String result = "";
+  uint8_t base = 10;
+
+  do {
+    char c = input % base;
+    input /= base;
+
+    if (c < 10)
+      c +='0';
+    else
+      c += 'A' - 10;
+    result = c + result;
+  } while (input);
+  return result;
 }
 
 /*****************************************************************
@@ -1164,6 +1230,7 @@ static void webserver_config_send_body_get(String& page_content) {
 	page_content += FPSTR(WEB_NBSP_NBSP_BRACE);
 	page_content += form_checkbox(Config_ssl_madavi, FPSTR(WEB_HTTPS), false);
 	page_content += FPSTR(WEB_BRACE_BR);
+	add_form_checkbox(Config_send2sdcard, FPSTR(WEB_SDCARD));
 	add_form_checkbox(Config_send2csv, FPSTR(WEB_CSV));
 	add_form_checkbox(Config_send2fsapp, FPSTR(WEB_FEINSTAUB_APP));
 	add_form_checkbox(Config_send2aircms, FPSTR(WEB_AIRCMS));
@@ -1563,7 +1630,7 @@ static void webserver_status() {
 		add_table_row_from_value(page_content, F("Last OTA"), delayToString(millis() - last_update_attempt));
 	}
 #if defined(ESP8266)
-    add_table_row_from_value(page_content, F("NTP Sync"), String(sntp_time_set));
+	add_table_row_from_value(page_content, F("NTP Sync"), String(sntp_time_set));
 	StreamString ntpinfo;
 
 	for (unsigned i = 0; i < SNTP_MAX_SERVERS; i++) {
@@ -1582,6 +1649,14 @@ static void webserver_status() {
 
 	time_t now = time(nullptr);
 	add_table_row_from_value(page_content, FPSTR(INTL_TIME_UTC), ctime(&now));
+	if (cfg::send2sdcard) {
+		DateTime nowRtc = rtc.now();
+		//debug_outln_info(localtime(&nowRtc));
+		//debug_outln_info(nowRtc.year());
+		//debug_outln_info(nowRtc.unixtime());
+		time_t tester = nowRtc.unixtime();
+		add_table_row_from_value(page_content, F("RTC Time (UTC)"), ctime(&tester));
+	}	
 	add_table_row_from_value(page_content, F("Uptime"), delayToString(millis() - time_point_device_start_ms));
 #if defined(ESP8266)
 	add_table_row_from_value(page_content, F("Reset Reason"), ESP.getResetReason());
@@ -1627,8 +1702,15 @@ static void webserver_status() {
 	server.sendContent(page_content);
 	page_content = emptyString;
 
-	if (count_sends > 0) {
+	if (Data_restored_count > 0) {
 		page_content += FPSTR(EMPTY_ROW);
+		add_table_row_from_value(page_content, F("Number of restored data"), String(Data_restored_count));
+	}
+
+	if (count_sends > 0) {
+		if (Data_restored_count == 0) {
+			page_content += FPSTR(EMPTY_ROW);
+		}
 		add_table_row_from_value(page_content, F(INTL_NUMBER_OF_MEASUREMENTS), String(count_sends));
 		if (sending_time > 0) {
 			add_table_row_from_value(page_content, F(INTL_TIME_SENDING_MS), String(sending_time), "ms");
@@ -2025,6 +2107,7 @@ static void wifiConfig() {
 	debug_outln_info_bool(F("SensorCommunity: "), cfg::send2dusti);
 	debug_outln_info_bool(F("Madavi: "), cfg::send2madavi);
 	debug_outln_info_bool(F("CSV: "), cfg::send2csv);
+	debug_outln_info_bool(F("SDCARD: "), cfg::send2sdcard);
 	debug_outln_info(FPSTR(DBG_TXT_SEP));
 	debug_outln_info_bool(F("Autoupdate: "), cfg::auto_update);
 	debug_outln_info_bool(F("Display: "), cfg::has_display);
@@ -2039,6 +2122,15 @@ static void waitForWifiToConnect(int maxRetries) {
 		delay(500);
 		debug_out(".", DEBUG_MIN_INFO);
 		++retryCount;
+	}
+	debug_outln_info(F("retryCount: "), retryCount);  
+	debug_outln_info(F("WiFi.status():"), int(WiFi.status()));  
+	
+	if (WiFi.status() == WL_CONNECTED) { 
+		// || (WiFi.status() == WL_NO_SSID_AVAIL)) {
+		debug_outln_info(F("WiFi.status(): "), int(WiFi.status()));  
+		debug_outln_info(F("WiFi reconnected - Restore failed data ..."));
+		restore_failed_data_from_sdcard();
 	}
 }
 
@@ -2177,7 +2269,7 @@ static unsigned long sendData(const LoggerEntry logger, const String& data, cons
 	HTTPClient http;
 	http.setTimeout(20 * 1000);
 	http.setUserAgent(SOFTWARE_VERSION + '/' + esp_chipid + '/' + esp_mac_id);
-    http.setReuse(false);
+	http.setReuse(false);
 	bool send_success = false;
 	if (logger == LoggerCustom && (*cfg::user_custom || *cfg::pwd_custom)) {
 		http.setAuthorization(cfg::user_custom, cfg::pwd_custom);
@@ -2209,9 +2301,48 @@ static unsigned long sendData(const LoggerEntry logger, const String& data, cons
 
 	if (!send_success && result != 0) {
 		loggerConfigs[logger].errors++;
-		last_sendData_returncode = result;
-	}
+		/*
+		INFO
+		#define HTTPC_ERROR_CONNECTION_REFUSED  (-1)
+		#define HTTPC_ERROR_SEND_HEADER_FAILED  (-2)
+		#define HTTPC_ERROR_SEND_PAYLOAD_FAILED (-3)
+		#define HTTPC_ERROR_NOT_CONNECTED       (-4)
+		#define HTTPC_ERROR_CONNECTION_LOST     (-5)
+		#define HTTPC_ERROR_NO_STREAM           (-6)
+		#define HTTPC_ERROR_NO_HTTP_SERVER      (-7)
+		#define HTTPC_ERROR_TOO_LESS_RAM        (-8)
+		#define HTTPC_ERROR_ENCODING            (-9)
+		#define HTTPC_ERROR_STREAM_WRITE        (-10)
+		#define HTTPC_ERROR_READ_TIMEOUT        (-11)
+		*/
 
+		time_t now = time(nullptr);
+		FsFile dataFile = SD.open("no_send_success.txt", FILE_WRITE);
+		String tempData;
+		tempData = ctime(&now);
+		tempData+= "   ";
+		tempData+= result;
+		tempData+= "   ";
+		tempData+= data;
+		tempData+= "\n";
+		if (dataFile) {
+			dataFile.println(tempData);
+			dataFile.close();
+		}
+		last_sendData_returncode = result;
+		// On failure write data to sdcard for restore later to influxDB with stored timestamp
+		if (logger == LoggerInflux && cfg::send2sdcard) {
+			// debug_outln_info(F("influxDB failed -> write to SDCARD"));
+			String tempData(data);
+			if (!tempData.endsWith("00000000")) { /* data was not restored from SDcard */
+				tempData.remove(tempData.length() - 1);
+				tempData += ' ';
+				tempData += String(time(nullptr), DEC);
+				tempData += "000000000";
+			} 
+			store_failed_data_at_sdcard(tempData);
+		}
+	}
 	return millis() - start_send;
 }
 
@@ -2309,6 +2440,131 @@ static void send_csv(const String& data) {
 	} else {
 		debug_outln_error(FPSTR(DBG_TXT_DATA_READ_FAILED));
 	}
+}
+
+/*****************************************************************
+ * store data as csv to sd-card                                  *
+ *****************************************************************/
+static void store_sdcard(const String& data) {
+	DynamicJsonDocument json2data(JSON_BUFFER_SIZE);
+	DeserializationError err = deserializeJson(json2data, data);
+
+	FsFile dataFile = SD.open("data.txt", FILE_WRITE);
+
+	if (!err && dataFile) {
+		String headline = F("Unixtime;");
+		String valueline(time(nullptr));
+		valueline += ';';
+		headline += F("Millis;");
+		valueline += act_milli;
+		valueline += ';';
+		for (JsonObject measurement : json2data[FPSTR(JSON_SENSOR_DATA_VALUES)].as<JsonArray>()) {
+			headline += measurement["value_type"].as<char*>();
+			headline += ';';
+			valueline += measurement["value"].as<char*>();
+			valueline += ';';
+		}
+		static bool first_csv_line = true;
+		if (first_csv_line) {
+			if (headline.length() > 0) {
+				headline.remove(headline.length() - 1);
+			}
+			dataFile.println(headline);
+			first_csv_line = false;
+		}
+		if (valueline.length() > 0) {
+			valueline.remove(valueline.length() - 1);
+		}
+		dataFile.println(valueline);
+		dataFile.close();
+		debug_outln_info(F("SDCARD data.txt: "), valueline); 
+	} 
+	else {
+		if (err) {
+			debug_outln_error(FPSTR(DBG_TXT_DATA_READ_FAILED));
+		}
+		if (!dataFile) {
+			debug_outln_error(F("Could not create data.txt at SD-Card. Is a SD-Card inserted with format FAT16 or FAT32?"));
+		}
+	}
+}
+
+/*****************************************************************
+ * store on connection failure influxDB-string to sd-card        *
+ *****************************************************************/
+static void store_failed_data_at_sdcard(const String& data) {
+	debug_outln_info(F("SDCARD fail.txt: "), data);
+	FsFile dataFile = SD.open("fail.txt", FILE_WRITE);
+	String tempData;
+	tempData = data;
+	tempData+= "\n";
+
+	if (dataFile) {
+		dataFile.print(tempData);
+		dataFile.close();
+	} 
+	else {
+		if (!dataFile) {
+			debug_outln_error(F("Could not create fail.txt at SD-Card. Is a SD-Card inserted with format FAT16 or FAT32?"));
+		}
+	}
+}
+
+/*****************************************************************
+ * restore missing data from sd-card to influxDB                 *
+ *****************************************************************/
+static void restore_failed_data_from_sdcard() {
+	unsigned long start_restore = millis();
+	debug_outln_info(F("Restore data from SDCARD"));
+
+	time_t now = time(nullptr);
+	FsFile fileTimeStamp = SD.open("restoreTimeStamp.txt", FILE_WRITE);
+	if (fileTimeStamp) {
+		fileTimeStamp.print(ctime(&now));
+		fileTimeStamp.close();
+	}  
+
+	FsFile failFile = SD.open("fail.txt", FILE_READ);
+
+	if (failFile) {
+		delay(10);
+		debug_outln_info(F("SDCARD fail.txt exists"));
+		debug_outln_info(F("failFile.available(): "), failFile.available());
+		if (SD.exists("failBAK.txt")) { SD.remove("failBAK.txt"); }
+		delay(10);
+		if (failFile.rename("failBAK.txt")) {
+			failFile.close();
+			FsFile bakFile = SD.open("failBAK.txt", FILE_READ);
+			if (bakFile) {
+				delay(10);
+				debug_outln_info(F("SDCARD failBAK.txt exists"));
+				debug_outln_info(F("bakFile.available(): "), bakFile.available());
+				last_sendData_returncode = 0;
+				Data_restored_count = 0;
+
+				String line;
+				while (bakFile.available()) {
+					line = bakFile.readStringUntil('\n');
+					sendData(LoggerInflux, line, 0, cfg::host_influx, cfg::url_influx);
+					Data_restored_count++;
+				}
+
+				if (!bakFile.available()) {
+					debug_outln_info(F("Delete failBAK.txt "));
+					bakFile.close();
+					SD.remove("failBAK.txt");
+				}
+				else {
+					bakFile.close();
+					debug_outln_info(F("failBAK.txt NOT delete - just close file handler"));
+				}
+			} 
+		}
+		else {
+			failFile.close();
+			debug_outln_info(F("No failBAK.txt at SDCARD or no SDCARD inserted and format FAT16 or FAT32?"));
+		}
+	} 
 }
 
 /*****************************************************************
@@ -4111,6 +4367,10 @@ static void logEnabledAPIs() {
 		debug_outln_info(F("Serial as CSV"));
 	}
 
+	if (cfg::send2sdcard) {
+		debug_outln_info(F("Store as CSV at SDcard"));
+	}
+
 	if (cfg::send2custom) {
 		debug_outln_info(F("custom API"));
 	}
@@ -4150,6 +4410,16 @@ static void setupNetworkTime() {
 			time_t now = time(nullptr);
 			debug_outln_info(F("SNTP synced: "), ctime(&now));
 			twoStageOTAUpdate();
+
+			if (cfg::send2sdcard) {
+				// Update RTC after successful NTP Update
+				debug_outln_info(F("RTC date/time update"));
+				/*if (!rtc.IsDateTimeValid()) {
+					debug_outln_info(F("RTC lost confidence in the DateTime! --> first time run or battery low"));
+				} */  
+				rtc.adjust(DateTime(uint32_t(now)));
+			}
+
 			last_update_attempt = millis();
 		}
 		sntp_time_set++;
@@ -4218,6 +4488,11 @@ static unsigned long sendDataToOptionalApis(const String &data) {
 		send_csv(data);
 	}
 
+	if (cfg::send2sdcard) {
+		debug_outln_info(F("## Store at sdcard: "));
+		store_sdcard(data);
+	}
+
 	return sum_send_time;
 }
 
@@ -4282,10 +4557,26 @@ void setup(void) {
 #endif
 	init_config();
 	init_display();
+ 
+	if (cfg::send2sdcard) {
+		if (!SD.begin(SD_CONFIG)) {
+			debug_outln_info(F("SD-Card Initialization failed!"));
+		}
+		else {
+			debug_outln_info(F("SD-Card successfully initialized!"));
+		}
+		if (!rtc.begin()) {
+			debug_outln_info(F("RTC Initialization failed!"));
+		}
+		else {
+			debug_outln_info(F("RTC successfully initialized!"));
+		}
+	}
+  
 	setupNetworkTime();
+	createLoggerConfigs(); // had to be moved before connctWifi() due to restore data from SD successful
 	connectWifi();
 	setup_webserver();
-	createLoggerConfigs();
 	debug_outln_info(F("\nChipId: "), esp_chipid);
 	debug_outln_info(F("\nMAC Id: "), esp_mac_id);
 
@@ -4318,6 +4609,10 @@ void setup(void) {
 void loop(void) {
 	String result_PPD, result_SDS, result_PMS, result_HPM;
 	String result_GPS, result_DNMS;
+	DateTime nowRtc;
+	uint32_t ts;
+	uint64_t unixTimeMs;
+	struct timeval tv;
 
 
 	unsigned sum_send_time = 0;
@@ -4328,12 +4623,25 @@ void loop(void) {
 	// Wait at least 30s for each NTP server to sync
 
 	if (!sntp_time_set && send_now &&
-			msSince(time_point_device_start_ms) < 1000 * 2 * 30 + 5000) {
+			msSince(time_point_device_start_ms) < 1000 * 30 + 5000) {
 		debug_outln_info(F("NTP sync not finished yet, skipping send"));
 		send_now = false;
 		starttime = act_milli;
 	}
+	else if (!sntp_time_set && send_now) {
+		// No NTP available -> get time from RTC
+		debug_outln_info(F("No NTP sync available, use RTC instead of"));
 
+		nowRtc = rtc.now();
+		ts = nowRtc.unixtime();
+		timeval epoch = {ts, 0}; // time in UTC
+		settimeofday((const timeval*)&epoch, 0);  
+	}
+	/*else if (!rtc.isrunning()) {
+		debug_outln_info(F("RTC set time!"));
+		rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+	}*/   
+  
 	sample_count++;
 	if (last_micro != 0) {
 		unsigned long diff_micro = act_micro - last_micro;
@@ -4526,7 +4834,7 @@ void loop(void) {
 			debug_outln_info(F("Connection lost, reconnecting "));
 			WiFi_error_count++;
 			WiFi.reconnect();
-			waitForWifiToConnect(20);
+			waitForWifiToConnect(30);
 		}
 
 		// only do a restart after finishing sending
@@ -4549,9 +4857,14 @@ void loop(void) {
 		min_micro = 1000000000;
 		max_micro = 0;
 		sum_send_time = 0;
-		starttime = millis();								// store the start time
 		count_sends++;
-	}
+		gettimeofday(&tv, NULL);
+		unixTimeMs = (tv.tv_sec * 1000LL + (tv.tv_usec / 1000LL));
+		/* set starttime according to unixTimeMs, so that next measurment is at an even time */
+		starttime = millis() - (unixTimeMs % cfg::sending_intervall_ms);
+		/* debug_outln_info(F("millis korrigiert: "), String(starttime)); */
+ 	}
+ 
 #if defined(ESP8266)
 	MDNS.update();
 	serialSDS.perform_work();

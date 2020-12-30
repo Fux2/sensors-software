@@ -133,6 +133,7 @@ const char WEB_BR_FORM[] PROGMEM = "<br/></form>";
 const char WEB_BR_LF_B[] PROGMEM = "<br/>\n<b>";
 const char WEB_LF_B[] PROGMEM = "\n<b>";
 const char WEB_CSV[] PROGMEM = "CSV";
+const char WEB_SDCARD[] PROGMEM = "SDCARD";
 const char WEB_FEINSTAUB_APP[] PROGMEM = "<a target='_blank' href='https://chillibits.com/pmapp'>Feinstaub-App</a>";
 const char WEB_OPENSENSEMAP[] PROGMEM = "<a target='_blank' href='https://opensensemap.org/about'>OpenSenseMap.org</a>";
 const char WEB_AIRCMS[] PROGMEM = "<a target='_blank' href='https://aircms.online/#/mission'>aircms.online</a>";
